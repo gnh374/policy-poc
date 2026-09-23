@@ -9,12 +9,21 @@ a RunState carrying step failures, log() for progress, and the same report
 markers. Nothing here needs a dependency `gh` does not already bring.
 
 Model
-  Every repo gets the overlays in registry `defaults.overlays`. A registry
-  entry deviates: `add` tightens, `remove` loosens -- and `remove` requires a
-  `waiver`, because loosening should never be a silent one-word edit.
+  A repo declares its class through a GitHub topic -- `octopus-hybrid` or
+  `octopus-public` -- and the registry maps that class to a set of rulesets.
+  Hybrid components therefore require `Build Validation` by default; it is not
+  something anyone has to remember to register.
+
+  An `exceptions` entry can tighten with `add` or loosen with `remove`, and
+  `remove` requires a `waiver`, so dropping a gate always costs a reviewed
+  pull request.
+
+  Topics are editable by anyone with push access, so observed fact outranks the
+  label: a repo that has posted `Build Validation` is treated as hybrid no
+  matter what its topic claims. Relabelling cannot remove a gate.
 
   `main-protection` keeps the name create_repo.py already uses in production,
-  so adopting this needs no rename across the fleet. Overlays we introduce are
+  so adopting this needs no rename across the fleet. Rulesets we introduce are
   named `policy/<name>`.
 
 Fail-safe
@@ -178,24 +187,46 @@ def load_policy(directory):
             "overlays": overlays}
 
 
-def resolve_overlays(repo_name, policy):
-    """defaults + add - remove, order preserved."""
+def classify(repo, policy):
+    """The repo's class, taken from its own GitHub topics.
+
+    Keeping the classification on the repo rather than in the registry means a
+    new repo is classified the moment it is created, the class is visible in
+    the GitHub UI, and it costs no extra API call -- topics come back with the
+    repo listing. The trade-off is that anyone with push access can edit a
+    topic, which is what the Build Validation cross-check below is for.
+    """
+    prefix = policy["registry"].get("class_topic_prefix", "octopus-")
+    classes = policy["registry"].get("classes", {})
+    found = [t[len(prefix):] for t in repo.get("topics", [])
+             if t.startswith(prefix) and t[len(prefix):] in classes]
+    if len(found) > 1:
+        return None, f"carries more than one class topic: {sorted(found)}"
+    return (found[0] if found else None), ""
+
+
+def resolve_rulesets(repo, cls, policy):
+    """Ruleset names for a repo of class `cls`. An exception entry can tighten
+    with `add` or loosen with `remove` -- and loosening needs a waiver, so a
+    reviewed pull request is the only way to drop a gate."""
     reg = policy["registry"]
-    names = list(reg.get("defaults", {}).get("overlays", []))
-    entry = next((e for e in reg.get("repositories", [])
-                  if e.get("name") == repo_name), None)
+    names = list(reg["classes"][cls] if cls else reg.get("unclassified", []))
+
+    entry = next((e for e in reg.get("exceptions", [])
+                  if e.get("name") == repo["name"]), None)
     if entry:
         if entry.get("remove") and not entry.get("waiver"):
-            die(f"{repo_name}: 'remove' requires a 'waiver' explaining why")
+            die(f"{repo['name']}: 'remove' requires a 'waiver' explaining why")
         for n in entry.get("add", []):
             if n not in names:
                 names.append(n)
         for n in entry.get("remove", []):
             if n in names:
                 names.remove(n)
+
     unknown = [n for n in names if n not in policy["overlays"]]
     if unknown:
-        die(f"{repo_name}: unknown overlay(s) {unknown}")
+        die(f"{repo['name']}: unknown ruleset(s) {unknown}")
     return names
 
 
@@ -295,23 +326,44 @@ def in_desired_state(spec, current):
 # reconcile
 # --------------------------------------------------------------------------
 
+TEAMCITY_CONTEXT = "Build Validation"
+
+
 def reconcile_rulesets(repo, policy, state, dry_run):
     full_name, name = repo["full_name"], repo["name"]
-    wanted = resolve_overlays(name, policy)
+
+    cls, problem = classify(repo, policy)
+    if problem:
+        state.add("x", f"{name}: {problem}")
+        return
+
     actual, err = managed_rulesets(full_name, set(policy["overlays"]))
     if actual is None:
         state.add("x", f"{name}: cannot read rulesets ({err})")
         return
 
-    seen = None
+    seen = observed_contexts(full_name)
+
+    # Topics are editable by anyone with push access, so the label on its own
+    # cannot be trusted to keep a gate in place -- relabelling a repo would
+    # otherwise drop its build gate with no review. Observed fact outranks the
+    # label: a repo that has posted Build Validation is treated as hybrid
+    # whatever its topic says. Dropping the gate then requires an exception
+    # entry with a waiver, which means a reviewed pull request.
+    if TEAMCITY_CONTEXT in seen and cls != "hybrid":
+        state.add("!", f"{name}: posts {TEAMCITY_CONTEXT!r} but class is "
+                       f"{cls or 'unset'} -- treating as hybrid, fix the topic")
+        cls = "hybrid"
+    elif cls is None:
+        state.add("!", f"{name}: no class topic -- treated as unclassified")
+
+    wanted = resolve_rulesets(repo, cls, policy)
     desired_names = []
 
     for overlay in wanted:
         spec = policy["overlays"][overlay]
         needs = required_contexts(spec)
         if needs:
-            if seen is None:
-                seen = observed_contexts(full_name)
             missing = [c for c in needs if c not in seen]
             if missing:
                 state.add("~", f"{name}: {overlay} REFUSED -- never observed {missing}")
@@ -468,6 +520,7 @@ def main():
     log(f"  deleted:   {state.count('-')}")
     log(f"  unchanged: {state.count('=')}")
     log(f"  skipped:   {state.count('~')}")
+    log(f"  warnings:  {state.count('!')}")
     log(f"  failed:    {state.count('x')}")
 
     # Every repo is attempted before the run fails -- same contract as the

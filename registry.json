@@ -1,16 +1,12 @@
 {
-  "defaults": {
-    "overlays": [
-      "main-protection",
-      "checks-common"
-    ]
+  "class_topic_prefix": "octopus-",
+
+  "classes": {
+    "hybrid": ["main-protection", "checks-common", "checks-teamcity"],
+    "public": ["main-protection", "checks-common"]
   },
-  "repositories": [
-    {
-      "name": "policy-poc-hybrid",
-      "add": [
-        "checks-teamcity"
-      ]
-    }
-  ]
+
+  "unclassified": ["main-protection"],
+
+  "exceptions": []
 }

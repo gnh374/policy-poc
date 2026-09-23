@@ -13,7 +13,7 @@ policies/
                            no rename across the fleet.
   checks-common.json       overlay — requires gate/merge
   checks-teamcity.json     overlay — requires Build Validation
-registry.json              defaults + per-repo add/remove
+registry.json              repo class -> rulesets, plus exceptions
 settings.json              repo settings, grouped by endpoint and scoped by
                            repo visibility (not expressible as ruleset rules)
 apply_policy.py            the reconciler
@@ -30,9 +30,40 @@ why a PR-time validator is not optional in the real thing.
 
 | | `registry.json` | `settings.json` |
 |---|---|---|
-| Answers | which rulesets a repo gets | what value a setting takes |
-| Varies by | repo | repo visibility |
+| Answers | which rulesets a repo class gets | what value a setting takes |
+| Varies by | repo class (from the repo's topic) | repo visibility |
 | Drives | `POST/PUT /repos/../rulesets` | `PATCH /repos/..` and two other endpoints |
+
+## How a repo is classified
+
+The repo says so itself, through a GitHub topic:
+
+```
+octopus-hybrid  ->  main-protection, policy/checks-common, policy/checks-teamcity
+octopus-public  ->  main-protection, policy/checks-common
+no topic        ->  main-protection, and a warning in the report
+```
+
+So `Build Validation` is required for every hybrid component by default —
+nobody has to remember to register it. The class is visible in the GitHub UI,
+`create_repo.py` can set it at creation (it already has `set_topics()`), and
+reading it costs no extra API call because topics come back with the repo
+listing.
+
+Topics are editable by anyone with push access, which would otherwise make the
+gate removable without review. So **observed fact outranks the label**: a repo
+that has posted `Build Validation` is treated as hybrid whatever its topic
+says, and the mismatch is reported.
+
+| Topic on a repo that posts `Build Validation` | Result |
+|---|---|
+| `octopus-hybrid` | applied, no warning |
+| `octopus-public` | still hybrid, warning to fix the topic |
+| none | still hybrid, warning to fix the topic |
+| both class topics | hard error, nothing applied |
+
+Dropping a gate therefore needs an `exceptions` entry with a `waiver` — a
+reviewed pull request, not a one-word edit.
 
 `settings.json` is grouped because `create_repo.py` has four separate settings
 steps behind three different endpoints, and two of them skip private repos:
