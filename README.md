@@ -14,9 +14,38 @@ policies/
   checks-common.json       overlay — requires gate/merge
   checks-teamcity.json     overlay — requires Build Validation
 registry.json              defaults + per-repo add/remove
-settings.json              repo settings (not expressible as ruleset rules)
+settings.json              repo settings, grouped by endpoint and scoped by
+                           repo visibility (not expressible as ruleset rules)
 apply_policy.py            the reconciler
 ```
+
+## The two non-GitHub files
+
+`policies/*.json` follow **GitHub's** rulesets schema — get them wrong and the
+API returns 422, which is how the octopus-base defects below were found.
+
+`registry.json` and `settings.json` are **ours**. Nothing validates them but
+this script, so a typo like `ad` instead of `add` is silently ignored. That is
+why a PR-time validator is not optional in the real thing.
+
+| | `registry.json` | `settings.json` |
+|---|---|---|
+| Answers | which rulesets a repo gets | what value a setting takes |
+| Varies by | repo | repo visibility |
+| Drives | `POST/PUT /repos/../rulesets` | `PATCH /repos/..` and two other endpoints |
+
+`settings.json` is grouped because `create_repo.py` has four separate settings
+steps behind three different endpoints, and two of them skip private repos:
+
+```
+repo                         PATCH /repos/{repo}
+actions_workflow             PUT   /repos/{repo}/actions/permissions/workflow
+code_scanning_default_setup  PATCH /repos/{repo}/code-scanning/default-setup
+```
+
+Each group takes `all`, `public` and `private` blocks, merged weakest-first.
+A group with nothing declared for a repo's visibility is skipped — which is
+exactly what `patch_security()` and `disable_codeql_default_setup()` do today.
 
 ## Running it
 
@@ -65,7 +94,7 @@ after applying. That covers a good part of what this plan set out to do.
 | `required_approving_review_count: 0` | `2` — the POC owner cannot approve their own PR |
 | `checks-common` requires only `gate/merge` | add `GitGuardian Security Checks` (confirmed present on hybrid PRs) |
 | `enforcement: active` everywhere | unchanged — `evaluate` is unavailable |
-| `settings.json` has 5 fields | `patch_settings()` sets 17, plus security and Actions permissions on their own endpoints, and two steps skip when the repo is private |
+| `settings.json` covers 11 fields across 3 endpoints | `patch_settings()` sets 17 — the rest are cosmetic repo toggles (`has_issues`, squash commit titles) worth copying across verbatim |
 | urllib → `gh` CLI | done — matches `create_repo.py`'s `run_gh()` so the lift is a copy, not a rewrite |
 
 ## Throwaway repos

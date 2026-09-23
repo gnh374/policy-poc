@@ -48,6 +48,33 @@ OVERLAY_PREFIX = "policy/"            # everything else we manage
 MANAGED_FIELDS = ("target", "enforcement", "conditions", "bypass_actors", "rules")
 
 
+def _read(path):
+    def reader(full_name):
+        ok, body, _ = gh_json("api", path.format(repo=full_name))
+        return body if ok and isinstance(body, dict) else None
+    return reader
+
+
+# One entry per settings group in settings.json. `read: None` means the repo
+# object already fetched carries the current values, so no extra call is needed.
+SETTINGS_GROUPS = {
+    "repo": {
+        "read": None,
+        "write": lambda r: ("api", "-X", "PATCH", f"repos/{r}"),
+    },
+    "actions_workflow": {
+        "read": _read("repos/{repo}/actions/permissions/workflow"),
+        "write": lambda r: ("api", "-X", "PUT",
+                            f"repos/{r}/actions/permissions/workflow"),
+    },
+    "code_scanning_default_setup": {
+        "read": _read("repos/{repo}/code-scanning/default-setup"),
+        "write": lambda r: ("api", "-X", "PATCH",
+                            f"repos/{r}/code-scanning/default-setup"),
+    },
+}
+
+
 # --------------------------------------------------------------------------
 # gh plumbing -- same shape as create_repo.py's helpers
 # --------------------------------------------------------------------------
@@ -332,20 +359,56 @@ def reconcile_rulesets(repo, policy, state, dry_run):
                   else f"{name}: {rs_name} delete failed -- {err}")
 
 
+def _scopes(repo):
+    """Settings blocks that apply to this repo, weakest key first so that a
+    visibility-specific value wins over `all`."""
+    return ("all", "private" if repo.get("private") else "public")
+
+
+def _desired_settings(group, repo):
+    merged = {}
+    for scope in _scopes(repo):
+        merged.update(group.get(scope, {}))
+    return merged
+
+
 def reconcile_settings(repo, settings, state, dry_run):
-    name = repo["name"]
-    drift = {k: v for k, v in settings.items() if repo.get(k) != v}
-    if not drift:
-        state.add("=", f"{name}: settings already in state")
-        return
-    if dry_run:
-        state.add("+", f"{name}: settings would be set {sorted(drift)}")
-        return
-    ok, _, err = gh_json("api", "-X", "PATCH", f"repos/{repo['full_name']}",
-                         "--input", "-", stdin_data=json.dumps(drift).encode())
-    state.add("+" if ok else "x",
-              f"{name}: settings set {sorted(drift)}" if ok
-              else f"{name}: settings failed -- {err}")
+    """Repo settings are not expressible as ruleset rules, and they do not all
+    live behind one endpoint -- create_repo.py has four separate steps, two of
+    which skip private repos entirely. The policy file carries values and
+    visibility; the endpoints stay here because they are implementation.
+    """
+    full_name, name = repo["full_name"], repo["name"]
+
+    for group_name, group in settings.items():
+        cfg = SETTINGS_GROUPS.get(group_name)
+        if cfg is None:
+            state.add("x", f"{name}: unknown settings group '{group_name}'")
+            continue
+
+        desired = _desired_settings(group, repo)
+        if not desired:
+            continue  # nothing declared for this repo's visibility
+
+        current = repo if cfg["read"] is None else cfg["read"](full_name)
+        if current is None:
+            state.add("~", f"{name}: {group_name} not readable, skipped")
+            continue
+
+        drift = {k: v for k, v in desired.items()
+                 if not _subset(v, current.get(k))}
+        if not drift:
+            state.add("=", f"{name}: {group_name} already in state")
+            continue
+        if dry_run:
+            state.add("+", f"{name}: {group_name} would set {sorted(drift)}")
+            continue
+
+        ok, _, err = gh_json(*cfg["write"](full_name), "--input", "-",
+                             stdin_data=json.dumps(drift).encode())
+        state.add("+" if ok else "x",
+                  f"{name}: {group_name} set {sorted(drift)}" if ok
+                  else f"{name}: {group_name} failed -- {err}")
 
 
 def reconcile_repo(repo, policy, state, dry_run):
