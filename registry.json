@@ -1,0 +1,16 @@
+{
+  "defaults": {
+    "overlays": [
+      "main-protection",
+      "checks-common"
+    ]
+  },
+  "repositories": [
+    {
+      "name": "policy-poc-hybrid",
+      "add": [
+        "checks-teamcity"
+      ]
+    }
+  ]
+}
