@@ -1,66 +1,106 @@
 # Demo — 5 minutes
 
-Four acts, in this order. The point is not the tooling; it is that a failing
-build can block a merge, and that changing who is gated is one line in one file.
-
-Prep: `export GH_TOKEN=$(gh auth token)`
-
-## Reset to a clean start
-
-The demo needs a PR whose head has no `Build Validation` yet.
+The loop being demonstrated: **edit policy in one repo, run the applier, watch
+the target repo change.** Everything else is supporting detail.
 
 ```bash
-git clone https://github.com/gnh374/policy-poc-hybrid.git /tmp/demo && cd /tmp/demo
-git checkout -b demo/$(date +%s)
-date > probe.txt && git add -A && git commit -m "Demo commit"
-git push -u origin HEAD
-gh pr create --fill
+export GH_TOKEN=$(gh auth token)
+git clone https://github.com/gnh374/policy-poc.git && cd policy-poc
 ```
 
-## Act 1 — the build result actually gates the merge
+---
+
+## Act 1 — add and remove a policy
+
+### Before
 
 ```bash
-gh pr view --json mergeStateStatus,statusCheckRollup \
-  | jq '{mergeStateStatus, checks:[.statusCheckRollup[]?|{n:(.name//.context),s:(.conclusion//.state)}]}'
+gh api repos/gnh374/policy-poc-hybrid/rulesets --jq '.[].name'
 ```
 
-`gate/merge` is **SUCCESS** and the PR is still **BLOCKED** — because a second,
-independent ruleset requires `Build Validation`, which TeamCity has not posted.
-This is the layering: two rulesets, both enforced.
+```
+main-protection
+my-manual-rule
+policy/checks-common
+policy/checks-teamcity
+```
 
-Now post it, as the TeamCity meta-runner does:
+### Edit the policy — one block in one file
 
 ```bash
-SHA=$(gh pr view --json headRefOid --jq .headRefOid)
-gh api repos/gnh374/policy-poc-hybrid/statuses/$SHA \
-  -f state=success -f context="Build Validation"
+grep -B1 -A3 policy-poc-hybrid registry.json
 ```
 
-Re-run the first command: **CLEAN**. Say `failure` instead of `success` and it
-goes back to blocked.
+Delete the `add` block so the entry reads:
 
-## Act 2 — changing who is gated is one line
-
-```bash
-grep -A2 policy-poc-hybrid registry.json
+```json
+{ "name": "policy-poc-hybrid" }
 ```
 
-Remove the `add: ["checks-teamcity"]` block, then:
+### Run the applier
 
 ```bash
 python3 apply_policy.py --owner gnh374 --repo policy-poc-hybrid
 ```
 
-The report shows `policy/checks-teamcity deleted (orphaned)` and the PR above
-unblocks without anyone touching GitHub settings. In production that edit
-arrives as a merged pull request, reviewed like any other change.
+```
+  = policy-poc-hybrid: main-protection already in state
+  = policy-poc-hybrid: checks-common already in state
+  - policy-poc-hybrid: policy/checks-teamcity deleted (orphaned)
+  = policy-poc-hybrid: settings already in state
+```
 
-Put the block back and re-run to restore the gate.
+### After
+
+```bash
+gh api repos/gnh374/policy-poc-hybrid/rulesets --jq '.[].name'
+```
+
+`policy/checks-teamcity` is gone. Put the `add` block back, run again, and it
+returns. Two directions, one file, nobody touched GitHub settings.
+
+Note what did **not** change: `my-manual-rule` was created by hand and survives
+every run. The applier only manages names it owns.
+
+> In production this edit arrives as a merged pull request and the applier runs
+> from CI. Wiring that up was deliberately left out of the POC — here it is run
+> by hand so the mechanism is visible.
+
+---
+
+## Act 2 — what the policy actually does
+
+With `checks-teamcity` back in place, open a PR on the target repo:
+
+```bash
+git clone https://github.com/gnh374/policy-poc-hybrid.git /tmp/demo && cd /tmp/demo
+git checkout -b demo/$(date +%s)
+date > probe.txt && git add -A && git commit -m "Demo commit" && git push -u origin HEAD
+gh pr create --fill
+gh pr view --json mergeStateStatus,statusCheckRollup \
+  | jq '{mergeStateStatus, checks:[.statusCheckRollup[]?|{n:(.name//.context),s:(.conclusion//.state)}]}'
+```
+
+`gate/merge` is **SUCCESS** and the PR is still **BLOCKED** — a second,
+independent ruleset requires `Build Validation`, which TeamCity has not posted.
+Both rulesets are enforced; that is the layering.
+
+Post it, exactly as the TeamCity meta-runner does:
+
+```bash
+SHA=$(gh pr view --json headRefOid --jq .headRefOid)
+gh api repos/gnh374/policy-poc-hybrid/statuses/$SHA -f state=success -f context="Build Validation"
+```
+
+Now **CLEAN**. Send `failure` instead and it blocks again. A failing build
+really does stop the merge.
+
+---
 
 ## Act 3 — a forgotten build cannot lock a repo
 
 ```bash
-python3 apply_policy.py --owner gnh374 --repo policy-poc-public
+cd -; python3 apply_policy.py --owner gnh374 --repo policy-poc-public
 ```
 
 ```
@@ -68,22 +108,23 @@ python3 apply_policy.py --owner gnh374 --repo policy-poc-public
 ```
 
 That repo has never produced `gate/merge`, so the requirement is refused rather
-than applied. Without this, one typo or one missing build config would leave
-every PR in a repo waiting forever, with no error anywhere.
+than applied. Without this, one typo in a context name would leave every PR in
+a repo waiting forever — GitHub reports no error, it simply never merges.
 
-Run it twice — the second run reports zero changes.
+Run it twice: the second run reports zero changes.
+
+---
 
 ## Act 4 — what this replaces
 
 ```bash
 cat reference/README.md
-gh api repos/gnh374/policy-poc-hybrid/rulesets --jq '.[].name'
 ```
 
 Two scripts write repository protection today and neither knows about the
-other: one adds the required check to classic protection, the other deletes
-classic protection outright. The four repos that have a gate are one sync run
-away from losing it.
+other. One adds the required check to classic branch protection; the other
+deletes classic protection outright. The four repos that have a gate are one
+sync run away from losing it, with nothing logged.
 
-Note `my-manual-rule` in that ruleset list — created by hand, and left
-untouched by every run above. The applier only manages names it owns.
+**Consider opening with this act.** The mechanism above only feels necessary
+once it is clear the current gate can disappear on its own.
