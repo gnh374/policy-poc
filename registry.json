@@ -2,7 +2,7 @@
   "class_topic_prefix": "octopus-",
 
   "classes": {
-    "hybrid": ["main-protection", "checks-common", "checks-teamcity"],
+    "hybrid": ["main-protection", "checks-common"],
     "public": ["main-protection", "checks-common"]
   },
 
