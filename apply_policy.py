@@ -38,10 +38,20 @@ Fail-safe
   runs (Actions, apps) are separate APIs; both count.
 
 Usage
-  python3 apply_policy.py --owner octopusden --all
+  python3 apply_policy.py --owner gnh374 --all
   python3 apply_policy.py --owner gnh374 --repo policy-poc-hybrid --dry-run
 
+Only the owners in ALLOWED_OWNERS can be targeted. This is the POC copy and it
+stays off octopusden entirely -- read-only included.
+
 Auth: $GH_TOKEN or $GITHUB_TOKEN, needing `administration:write` on the targets.
+
+Known gap
+  A token without admin access gets an empty ruleset list rather than an
+  error, which is indistinguishable from "this repo has no rulesets" -- so the
+  script would try to create ones that already exist. Before this runs
+  anywhere real it needs a preflight that proves admin access first;
+  create_repo.py already has a preflight() step shaped for exactly that.
 """
 import argparse
 import json
@@ -52,6 +62,7 @@ from pathlib import Path
 
 TOKEN = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or ""
 
+ALLOWED_OWNERS = {"gnh374"}        # POC guard -- see main()
 BASELINE = "main-protection"          # the name create_repo.py already uses
 OVERLAY_PREFIX = "policy/"            # everything else we manage
 MANAGED_FIELDS = ("target", "enforcement", "conditions", "bypass_actors", "rules")
@@ -488,6 +499,13 @@ def main():
         die("no token found. Set GH_TOKEN (or GITHUB_TOKEN).")
     if run_gh("--version").returncode != 0:
         die("gh CLI not found on PATH.")
+    # This is the POC copy. It is confined to throwaway accounts on purpose --
+    # nothing here should reach octopusden, not even read-only, until the logic
+    # has been lifted into create_repo.py and reviewed there.
+    if args.owner not in ALLOWED_OWNERS:
+        die(f"owner '{args.owner}' is not allowed in the POC. "
+            f"Allowed: {', '.join(sorted(ALLOWED_OWNERS))}. "
+            f"Remove this guard only when lifting the logic into create_repo.py.")
 
     policy = load_policy(args.policy_dir)
 
