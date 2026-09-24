@@ -1,12 +1,26 @@
 {
   "class_topic_prefix": "octopus-",
-
   "classes": {
-    "hybrid": ["main-protection", "checks-common"],
-    "public": ["main-protection", "checks-common"]
+    "hybrid": [
+      "main-protection",
+      "checks-common",
+      "checks-teamcity"
+    ],
+    "public": [
+      "main-protection",
+      "checks-common"
+    ]
   },
+  "unclassified": [
+    "main-protection"
+  ],
+  "additions": [
+    {
+      "name": "policy-poc-hybrid",
+      "rulesets": ["checks-e2e"],
+      "note": "has an E2E stage the other hybrid components do not"
+    }
+  ],
 
-  "unclassified": ["main-protection"],
-
-  "exceptions": []
+  "waivers": []
 }

@@ -26,13 +26,14 @@ Model
   so adopting this needs no rename across the fleet. Rulesets we introduce are
   named `policy/<name>`.
 
-Fail-safe
-  An overlay requiring a status check the repo has never produced is REFUSED,
-  not applied. Forgetting to wire up a build leaves a repo *ungated*, never
-  *locked* -- GitHub waits forever for a context that never arrives, with no
-  error anywhere.
+Enforcement
+  Policy is applied as written. A required check is set even on a repo that has
+  never produced it, which blocks every PR there until the check starts
+  arriving -- deliberately, so a missing build is a loud problem rather than a
+  quiet exemption. The run reports each repo it has just put in that state.
 
-  Contexts are read from recent PR head commits. A merge-gate workflow
+  Contexts are still read, both to report those repos and to keep the class
+  cross-check honest. They come from recent PR head commits. A merge-gate workflow
   triggered only by `pull_request` leaves no trace on the default branch, so
   looking there reports false absences. Commit statuses (TeamCity) and check
   runs (Actions, apps) are separate APIs; both count.
@@ -217,28 +218,49 @@ def classify(repo, policy):
 
 
 def resolve_rulesets(repo, cls, policy):
-    """Ruleset names for a repo of class `cls`. An exception entry can tighten
-    with `add` or loosen with `remove` -- and loosening needs a waiver, so a
-    reviewed pull request is the only way to drop a gate."""
+    """Ruleset names for a repo of class `cls`.
+
+    Two separate lists rather than one list of "exceptions" with a direction
+    field: tightening and loosening are not the same act. An `additions` entry
+    needs no justification -- nobody is harmed by a stricter repo. A `waivers`
+    entry drops a ruleset the class asked for, and the list it lives in carries
+    `reason` and `review_by` as fields, so the justification is structural
+    rather than a rule the applier has to remember to enforce.
+    """
     reg = policy["registry"]
     names = list(reg["classes"][cls] if cls else reg.get("unclassified", []))
+    repo_name = repo["name"]
 
-    entry = next((e for e in reg.get("exceptions", [])
-                  if e.get("name") == repo["name"]), None)
-    if entry:
-        if entry.get("remove") and not entry.get("waiver"):
-            die(f"{repo['name']}: 'remove' requires a 'waiver' explaining why")
-        for n in entry.get("add", []):
+    for entry in reg.get("additions", []):
+        if entry.get("name") != repo_name:
+            continue
+        for n in entry.get("rulesets", []):
             if n not in names:
                 names.append(n)
-        for n in entry.get("remove", []):
+
+    for entry in reg.get("waivers", []):
+        if entry.get("name") != repo_name:
+            continue
+        if not entry.get("reason"):
+            die(f"{repo_name}: waiver needs a 'reason'")
+        for n in entry.get("drop", []):
             if n in names:
                 names.remove(n)
 
     unknown = [n for n in names if n not in policy["overlays"]]
     if unknown:
-        die(f"{repo['name']}: unknown ruleset(s) {unknown}")
+        die(f"{repo_name}: unknown ruleset(s) {unknown}")
     return names
+
+
+def expired_waivers(policy, today=None):
+    """Waivers past their review date. A loosening with no expiry quietly
+    becomes permanent, so the run surfaces the ones that are overdue."""
+    import datetime
+    today = today or datetime.date.today().isoformat()
+    return [(e["name"], e.get("review_by"), e.get("reason", ""))
+            for e in policy["registry"].get("waivers", [])
+            if e.get("review_by") and e["review_by"] < today]
 
 
 def required_contexts(spec):
@@ -256,11 +278,30 @@ def required_contexts(spec):
 # --------------------------------------------------------------------------
 
 def list_repos(owner):
+    """Every repo the owner owns -- including the private ones.
+
+    `/users/{owner}/repos` lists only what is publicly visible, so a private
+    repo would be skipped without ever being reported as ungated: the script
+    would not know it exists. When the token authenticates as the owner
+    (create_repo.py's preflight already requires that) `/user/repos` sees
+    everything they own.
+    """
     ok, who, err = gh_json("api", f"users/{owner}")
     if not ok:
         die(f"cannot read owner '{owner}': {err}")
-    base = "orgs" if who.get("type") == "Organization" else "users"
-    ok, repos, err = gh_paged(f"{base}/{owner}/repos")
+
+    if who.get("type") == "Organization":
+        path = f"orgs/{owner}/repos?type=all"
+    else:
+        ok, me, _ = gh_json("api", "user")
+        if ok and me.get("login") == owner:
+            path = "user/repos?affiliation=owner"
+        else:
+            log(f"WARNING: token does not authenticate as {owner}; listing "
+                f"public repos only -- private repos will be missed entirely")
+            path = f"users/{owner}/repos"
+
+    ok, repos, err = gh_paged(path)
     if not ok:
         die(f"listing repos for '{owner}': {err}")
     return repos
@@ -373,12 +414,14 @@ def reconcile_rulesets(repo, policy, state, dry_run):
 
     for overlay in wanted:
         spec = policy["overlays"][overlay]
-        needs = required_contexts(spec)
-        if needs:
-            missing = [c for c in needs if c not in seen]
-            if missing:
-                state.add("~", f"{name}: {overlay} REFUSED -- never observed {missing}")
-                continue
+        # Policy is enforced as written: a required check is applied whether or
+        # not the repo has ever produced it. GitHub waits forever for a context
+        # that never arrives -- no error, no timeout, just BLOCKED -- so the gap
+        # is reported loudly here instead of being discovered on someone's PR.
+        missing = [c for c in required_contexts(spec) if c not in seen]
+        if missing:
+            state.add("!", f"{name}: {overlay} applied but {missing} has never "
+                           f"been produced here -- PRs will block until it is")
 
         desired_names.append(spec["name"])
         current = actual.get(spec["name"])
@@ -484,6 +527,87 @@ def reconcile_repo(repo, policy, state, dry_run):
 
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# repo creation -- the slice of create_repo.py that policy depends on
+# --------------------------------------------------------------------------
+
+MERGE_GATE_WORKFLOW = """name: Merge Gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gate:
+    # Job name is the check-run name branch protection points at.
+    name: gate/merge
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "merge gate ok"
+"""
+
+
+def _put_file(full_name, path, text, message):
+    import base64
+    body = {"message": message,
+            "content": base64.b64encode(text.encode()).decode()}
+    return gh_json("api", "-X", "PUT", f"repos/{full_name}/contents/{path}",
+                   "--input", "-", stdin_data=json.dumps(body).encode())
+
+
+def create_repo(owner, name, cls, with_ci, state):
+    """The part of create_repo.py that policy depends on: the repo exists, it
+    is not empty, and it carries its class topic before any ruleset is applied.
+
+    Deliberately partial. The real script also handles contributors, the Prod
+    environment, secrets and Sonar provisioning -- none of which change what
+    policy does, and all of which need credentials a demo should not need.
+    """
+    full_name = f"{owner}/{name}"
+
+    ok, _, err = gh_json("api", f"repos/{full_name}")
+    if ok:
+        state.add("~", f"{name}: already exists, not recreated")
+    else:
+        ok, _, err = gh_json("api", "-X", "POST", "user/repos", "--input", "-",
+                             stdin_data=json.dumps(
+                                 {"name": name, "private": False,
+                                  "description": "CD-5795 policy POC (throwaway)",
+                                  "auto_init": False}).encode())
+        if not ok:
+            state.add("x", f"{name}: repo create failed -- {err}")
+            return None
+        state.add("+", f"{name}: repo created")
+
+    # A repo with no commits has no default branch, and a ruleset targeting
+    # ~DEFAULT_BRANCH has nothing to attach to. The first file creates it.
+    ok, _, _ = _put_file(full_name, "README.md",
+                         f"# {name}\n\nThrowaway repo for the CD-5795 policy POC.\n",
+                         "Initial commit")
+    state.add("+" if ok else "=", f"{name}: README.md"
+              + ("" if ok else " already present"))
+
+    if with_ci:
+        ok, _, _ = _put_file(full_name, ".github/workflows/merge-gate.yml",
+                             MERGE_GATE_WORKFLOW, "Add the merge gate")
+        state.add("+" if ok else "=", f"{name}: merge-gate workflow"
+                  + ("" if ok else " already present"))
+    else:
+        state.add("~", f"{name}: no merge-gate workflow -- overlays stay "
+                       f"refused until CI exists")
+
+    topic = f"octopus-{cls}"
+    ok, _, err = gh_json("api", "-X", "PUT", f"repos/{full_name}/topics",
+                         "--input", "-",
+                         stdin_data=json.dumps({"names": [topic]}).encode())
+    state.add("+" if ok else "x",
+              f"{name}: class topic {topic}" if ok
+              else f"{name}: topic failed -- {err}")
+
+    ok, repo, _ = gh_json("api", f"repos/{full_name}")
+    return repo if ok else None
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     p.add_argument("--owner", required=True)
@@ -491,6 +615,12 @@ def main():
     g.add_argument("--all", action="store_true",
                    help="every non-archived repo of the owner")
     g.add_argument("--repo", action="append", help="repo name (repeatable)")
+    g.add_argument("--create", metavar="NAME",
+                   help="create this repo, stamp its class topic, then apply policy")
+    p.add_argument("--class", dest="cls", choices=("hybrid", "public"),
+                   help="repo class for --create; becomes the octopus-<class> topic")
+    p.add_argument("--with-ci", action="store_true",
+                   help="with --create, also seed a merge-gate workflow")
     p.add_argument("--policy-dir", default=".")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
@@ -509,7 +639,19 @@ def main():
 
     policy = load_policy(args.policy_dir)
 
-    if args.all:
+    if args.create:
+        if not args.cls:
+            die("--create needs --class hybrid|public")
+        if args.dry_run:
+            die("--create cannot be combined with --dry-run")
+        log("==> Creating repository")
+        created = create_repo(args.owner, args.create, args.cls,
+                              args.with_ci, RunState())
+        log("")
+        if created is None:
+            die("repo creation failed; nothing was applied")
+        repos = [created]
+    elif args.all:
         repos = list_repos(args.owner)
     else:
         repos = []
@@ -540,6 +682,13 @@ def main():
     log(f"  skipped:   {state.count('~')}")
     log(f"  warnings:  {state.count('!')}")
     log(f"  failed:    {state.count('x')}")
+
+    overdue = expired_waivers(policy)
+    if overdue:
+        log("")
+        log(f"Waivers past review date -- {len(overdue)}:")
+        for name, when, reason in overdue:
+            log(f"  {name}  (due {when})  {reason}")
 
     # Every repo is attempted before the run fails -- same contract as the
     # sync-rulesets workflow this replaces.
