@@ -17,10 +17,21 @@
   "additions": [
     {
       "name": "policy-poc-hybrid",
-      "rulesets": ["checks-e2e"],
+      "rulesets": [
+        "checks-e2e"
+      ],
       "note": "has an E2E stage the other hybrid components do not"
     }
   ],
-
-  "waivers": []
+  "waivers": [
+    {
+      "name": "policy-poc",
+      "drop": [
+        "main-protection"
+      ],
+      "reason": "the policy repo itself; gating it blocks the PRs that change policy",
+      "ticket": "CD-XXXX",
+      "review_by": "2026-12-31"
+    }
+  ]
 }
